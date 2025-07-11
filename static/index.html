@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Voice to Text Demo</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f6f8fa;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+    }
+    .container {
+      background: #fff;
+      margin-top: 60px;
+      padding: 32px 40px;
+      border-radius: 12px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+      min-width: 340px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 {
+      margin-bottom: 16px;
+      color: #24292f;
+    }
+    button {
+      background: #2ea44f;
+      color: #fff;
+      border: none;
+      padding: 12px 28px;
+      border-radius: 6px;
+      font-size: 1.1em;
+      cursor: pointer;
+      margin-bottom: 24px;
+      transition: background 0.2s;
+    }
+    button:hover {
+      background: #22863a;
+    }
+    .transcript-label {
+      font-weight: bold;
+      margin-bottom: 6px;
+      color: #57606a;
+    }
+    #output {
+      background: #f1f8ff;
+      border: 1px solid #c8e1ff;
+      border-radius: 6px;
+      padding: 14px 18px;
+      min-height: 32px;
+      min-width: 220px;
+      color: #24292f;
+      font-size: 1.05em;
+      margin-bottom: 0;
+    }
+    .recording {
+      color: red;
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎤 Speak and Transcribe</h1>
+    <div class="recording" id="recording-indicator"></div>
+    <button onclick="toggleRecording()">Start Recording</button>
+    <div class="transcript-label">Transcript:</div>
+    <div id="output">Waiting...</div>
+  </div>
+<body>
+<script>
+  let audioContext, processor, micStream;
+let isRecording = false;
+let speaking = false;
+let silenceTimeout;
+let socket;
+let mediaRecorder;
+let availableVoices = [];
+
+// 🚀 Load voices
+function loadVoices() {
+  availableVoices = speechSynthesis.getVoices();
+
+  if (!availableVoices.length) {
+    speechSynthesis.onvoiceschanged = () => {
+      availableVoices = speechSynthesis.getVoices();
+      console.log("✅ Voices loaded:", availableVoices.map(v => v.name));
+    };
+  } else {
+    console.log("✅ Voices loaded:", availableVoices.map(v => v.name));
+  }
+}
+loadVoices();
+
+// 🎙️ Detect silence
+function detectSilence(stream, onSoundStart, onSoundStop, threshold = -50, timeout = 1000) {
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const mic = audioContext.createMediaStreamSource(stream);
+  processor = audioContext.createScriptProcessor(2048, 1, 1);
+
+  mic.connect(processor);
+  processor.connect(audioContext.destination);
+
+  processor.onaudioprocess = function (event) {
+    const input = event.inputBuffer.getChannelData(0);
+    let total = 0;
+
+    for (let i = 0; i < input.length; i++) {
+      total += input[i] * input[i];
+    }
+
+    const rms = Math.sqrt(total / input.length);
+    const db = 20 * Math.log10(rms);
+
+    if (db > threshold) {
+      if (!speaking) {
+        speaking = true;
+        onSoundStart();
+      }
+      clearTimeout(silenceTimeout);
+      silenceTimeout = setTimeout(() => {
+        speaking = false;
+        onSoundStop();
+      }, timeout);
+    }
+  };
+}
+
+// 🎛️ Toggle recording
+async function toggleRecording() {
+  const button = document.querySelector("button");
+  const indicator = document.getElementById("recording-indicator");
+  const output = document.getElementById("output");
+
+  if (!isRecording) {
+    socket = new WebSocket("ws://localhost:8000/ws");
+
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.text) {
+        output.innerText += (data.type === "user" ? "🧑: " : "🤖: ") + data.text + "\n";
+        if (data.type === "ai") {
+          speak(data.text);
+        }
+      }
+    };
+
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(micStream);
+
+    mediaRecorder.ondataavailable = function (e) {
+      if (e.data.size > 0 && socket.readyState === WebSocket.OPEN) {
+        socket.send(e.data);
+      }
+    };
+
+    detectSilence(
+      micStream,
+      () => {
+        indicator.innerText = "🎙️ Speaking...";
+        mediaRecorder.start();
+      },
+      () => {
+        indicator.innerText = "⏹️ Silence detected...";
+        mediaRecorder.stop();
+      }
+    );
+
+    button.innerText = "Stop Recording";
+    isRecording = true;
+    indicator.innerText = "Listening...";
+  } else {
+    stopRecording();
+  }
+}
+
+// 🛑 Stop all audio
+function stopRecording() {
+  if (processor) processor.disconnect();
+  if (micStream) micStream.getTracks().forEach(track => track.stop());
+  if (audioContext) audioContext.close();
+  if (socket) socket.close();
+
+  document.getElementById("recording-indicator").innerText = "";
+  document.querySelector("button").innerText = "Start Recording";
+  isRecording = false;
+}
+
+// 🗣️ Speak with emotion per phrase
+function speak(text) {
+  const phrases = text.split(/([,.!?] )/g);
+  const combined = [];
+
+  for (let i = 0; i < phrases.length; i += 2) {
+    combined.push((phrases[i] || "") + (phrases[i + 1] || ""));
+  }
+
+  let index = 0;
+
+  function speakNext() {
+    if (index >= combined.length) return;
+
+    const segment = combined[index].trim();
+    index++;
+
+    if (!segment) {
+      speakNext();
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(segment);
+    utterance.lang = 'en-US';
+    utterance.volume = 1;
+
+    // 🎭 Emotion detection
+    const emotion = segment.toLowerCase();
+
+    if (/(yay|awesome|great|fantastic|congrats|amazing|happy|woohoo|delighted|uplifted|hopeful)/.test(emotion)) {
+      utterance.pitch = 1.6;
+      utterance.rate = 1.15;
+    } else if (/(sorry|sad|heartbreaking|miss|painful|tear|lonely|hopeless|tough|exhausted)/.test(emotion)) {
+      utterance.pitch = 0.75;
+      utterance.rate = 0.85;
+    } else if (/(hmm|interesting|wonder|uncertain|maybe|thinking)/.test(emotion)) {
+      utterance.pitch = 1.25;
+      utterance.rate = 0.8;
+    } else if (/(angry|mad|upset|furious|annoyed|leave me alone|sick of it)/.test(emotion)) {
+      utterance.pitch = 0.9;
+      utterance.rate = 1.3;
+    } else if (/(love|sweetheart|hug|support|care|warm|believe in you|you're safe)/.test(emotion)) {
+      utterance.pitch = 1.4;
+      utterance.rate = 0.9;
+    } else if (/(confused|what's going on|don't understand|strange|unclear)/.test(emotion)) {
+      utterance.pitch = 1.1;
+      utterance.rate = 1.0;
+    } else if (/(wow|seriously|omg|unbelievable|no way|jaw dropping)/.test(emotion)) {
+      utterance.pitch = 1.5;
+      utterance.rate = 1.2;
+    } else {
+      utterance.pitch = 1.0;
+      utterance.rate = 1.0;
+    }
+
+    // 🎙️ Pick best available voice
+    utterance.voice =
+      availableVoices.find(v => v.name.includes("Google UK English Female")) ||
+      availableVoices.find(v => v.name.includes("Natural")) ||
+      availableVoices.find(v => v.name.includes("Aria")) ||
+      availableVoices.find(v => v.name.includes("Samantha")) ||
+      availableVoices[0];
+
+    utterance.onstart = () => {
+      if (mediaRecorder && mediaRecorder.state === "recording") {
+        mediaRecorder.stop();
+        console.log("🎤 Recording paused for speech synthesis");
+      }
+      if (processor) processor.disconnect();
+    };
+
+    utterance.onend = () => {
+      if (isRecording) {
+        detectSilence(micStream,
+          () => mediaRecorder.start(),
+          () => mediaRecorder.stop()
+        );
+      }
+      speakNext(); // continue to next phrase
+    };
+
+    speechSynthesis.speak(utterance);
+  }
+
+  speakNext();
+}
+</script>
+
+</body>
+</html>
